@@ -547,7 +547,7 @@ async def get_all_signals_for_export() -> list[dict[str, Any]]:
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, slot_start, side, entry_price, is_win "
+            "SELECT id, slot_start, side, entry_price, is_win, filter_blocked "
             "FROM signals WHERE skipped = 0 ORDER BY id ASC"
         )
         rows = await cursor.fetchall()

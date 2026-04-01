@@ -20,9 +20,15 @@ def format_signal(
     adx_value: float | None = None,
     n2_filter_enabled: bool = True,
     n2_side: str | None = None,
+    filter_blocked: bool = False,
 ) -> str:
     side_emoji = "\U0001f4c8" if side == "Up" else "\U0001f4c9"
-    at_line = "\U0001f916 AutoTrade: ON \u2192 Order Placed" if autotrade else "\U0001f916 AutoTrade: OFF"
+    if not autotrade:
+        at_line = "\U0001f916 AutoTrade: OFF"
+    elif filter_blocked:
+        at_line = "\U0001f916 AutoTrade: ON (Trade Blocked by N-2 Filter)"
+    else:
+        at_line = "\U0001f916 AutoTrade: ON \u2192 Order Placed"
 
     # ADX info line
     adx_line = ""

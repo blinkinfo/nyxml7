@@ -350,6 +350,7 @@ async def _check_and_trade() -> None:
         adx_value=adx_value,
         n2_filter_enabled=(await queries.is_n2_filter_enabled()),
         n2_side=filter_result.n2_side,
+        filter_blocked=(not filter_result.allowed),
     )
     await _send_telegram(msg)
 
