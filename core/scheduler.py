@@ -286,16 +286,25 @@ async def _auto_redeem_job() -> None:
     # Persist to DB
     for r in new_results:
         try:
+            is_success = bool(r.get("success"))
+            is_verified = is_success and bool(r.get("verified_zero_balance"))
+            if is_verified:
+                db_status = "verified"
+            elif is_success:
+                db_status = "success"
+            else:
+                db_status = "failed"
             await queries.insert_redemption(
                 condition_id=r["condition_id"],
                 outcome_index=r["outcome_index"],
                 size=r["size"],
                 title=r.get("title"),
                 tx_hash=r.get("tx_hash"),
-                status="success" if r.get("success") else "failed",
+                status=db_status,
                 error=r.get("error"),
                 gas_used=r.get("gas_used"),
                 dry_run=False,
+                verified=is_verified,
             )
         except Exception:
             log.exception(

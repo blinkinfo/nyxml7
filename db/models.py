@@ -60,7 +60,9 @@ CREATE TABLE IF NOT EXISTS redemptions (
     error TEXT,
     gas_used INTEGER,
     dry_run INTEGER NOT NULL DEFAULT 0,
-    resolved_at TIMESTAMP
+    resolved_at TIMESTAMP,
+    verified INTEGER NOT NULL DEFAULT 0,
+    verified_at TIMESTAMP
 );
 """
 
@@ -141,6 +143,18 @@ async def migrate_db(db_path: str | None = None) -> None:
             await db.execute("ALTER TABLE signals ADD COLUMN filter_blocked INTEGER DEFAULT 0")
         if "pattern" not in sig_columns:
             await db.execute("ALTER TABLE signals ADD COLUMN pattern TEXT")
+
+        # Check existing columns in redemptions table
+        cursor3 = await db.execute("PRAGMA table_info(redemptions)")
+        red_columns = {row[1] for row in await cursor3.fetchall()}
+        if "verified" not in red_columns:
+            await db.execute(
+                "ALTER TABLE redemptions ADD COLUMN verified INTEGER NOT NULL DEFAULT 0"
+            )
+        if "verified_at" not in red_columns:
+            await db.execute(
+                "ALTER TABLE redemptions ADD COLUMN verified_at TIMESTAMP"
+            )
 
         # Seed any missing default settings (idempotent)
         for key, value in DEFAULT_SETTINGS.items():

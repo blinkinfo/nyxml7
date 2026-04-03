@@ -276,16 +276,18 @@ async def insert_redemption(
     error: str | None = None,
     gas_used: int | None = None,
     dry_run: bool = False,
+    verified: bool = False,
 ) -> int:
     """Insert a redemption record. Returns the new row id."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    resolved_at = now if status in ("success", "failed") else None
+    resolved_at = now if status in ("success", "failed", "verified") else None
+    verified_at = now if verified else None
     async with aiosqlite.connect(_db()) as db:
         cursor = await db.execute(
             "INSERT INTO redemptions "
             "(condition_id, outcome_index, size, title, tx_hash, status, "
-            " error, gas_used, dry_run, resolved_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " error, gas_used, dry_run, resolved_at, verified, verified_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 condition_id,
                 outcome_index,
@@ -297,6 +299,8 @@ async def insert_redemption(
                 gas_used,
                 1 if dry_run else 0,
                 resolved_at,
+                1 if verified else 0,
+                verified_at,
             ),
         )
         await db.commit()
@@ -316,16 +320,17 @@ async def get_recent_redemptions(n: int = 20) -> list[dict[str, Any]]:
 
 
 async def redemption_already_recorded(condition_id: str) -> bool:
-    """Return True if a successful (non-dry-run) redemption exists for *condition_id*.
+    """Return True if a verified (non-dry-run) redemption exists for *condition_id*.
 
-    Prevents double-redemption: if we already have a success record for this
-    condition, the scheduler skips it on the next scan.
+    Only suppresses retries for verified redemptions.
+    Old 'success' rows with verified=0 are from the buggy EOA path — retry them.
     """
     async with aiosqlite.connect(_db()) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT id FROM redemptions "
-            "WHERE condition_id = ? AND status = 'success' AND dry_run = 0 LIMIT 1",
+            "WHERE condition_id = ? AND dry_run = 0 "
+            "AND (status = 'verified' OR (status = 'success' AND verified = 1)) LIMIT 1",
             (condition_id,),
         )
         row = await cursor.fetchone()
@@ -345,6 +350,35 @@ async def delete_redemptions_for_condition(condition_id: str) -> int:
         )
         await db.commit()
         return cursor.rowcount
+
+
+async def update_redemption_verified(redemption_id: int) -> None:
+    """Mark a redemption row as verified: set verified=1, verified_at=now, status='verified'."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    async with aiosqlite.connect(_db()) as db:
+        await db.execute(
+            "UPDATE redemptions SET verified = 1, verified_at = ?, status = 'verified' "
+            "WHERE id = ?",
+            (now, redemption_id),
+        )
+        await db.commit()
+
+
+async def get_unverified_success_redemptions() -> list[dict[str, Any]]:
+    """Return all non-dry-run redemption rows where status='success' and verified=0.
+
+    These are candidates for re-verification or retry (e.g. rows recorded by
+    the buggy EOA path that succeeded on-chain but may not have actually redeemed).
+    """
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM redemptions "
+            "WHERE status = 'success' AND verified = 0 AND dry_run = 0 "
+            "ORDER BY id ASC"
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
 
 
 async def get_redemption_stats() -> dict[str, Any]:

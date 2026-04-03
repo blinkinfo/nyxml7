@@ -6,7 +6,8 @@ Flow
 1. Query https://data-api.polymarket.com/positions?user=<wallet> to find positions
    where size > 0 and the market is resolved (outcome price = 1.0 or 0.0).
 2. For each redeemable position, call CTF.redeemPositions() on Polygon.
-3. The transaction is signed via EIP-712 / raw private key using web3.py.
+3. For sig_type==2 (Gnosis Safe), the call is wrapped in Safe.execTransaction()
+   so the Safe (which holds the tokens) is msg.sender on the CTF contract.
 4. Results are recorded in the `redemptions` DB table.
 
 Contracts (Polygon mainnet)
@@ -53,6 +54,98 @@ _CTF_ABI = [
         "type": "function",
         "stateMutability": "view",
         "inputs": [{"name": "conditionId", "type": "bytes32"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [
+            {"name": "account", "type": "address"},
+            {"name": "id",      "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+    {
+        "name": "getPositionId",
+        "type": "function",
+        "stateMutability": "pure",
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "collectionId",    "type": "bytes32"},
+        ],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+    {
+        "name": "getCollectionId",
+        "type": "function",
+        "stateMutability": "pure",
+        "inputs": [
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId",        "type": "bytes32"},
+            {"name": "indexSet",           "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "bytes32"}],
+    },
+]
+
+# Gnosis Safe ABI — module-level so main.py can import it for the sanity check
+_SAFE_ABI = [
+    {
+        "name": "getTransactionHash",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [
+            {"name": "to",             "type": "address"},
+            {"name": "value",          "type": "uint256"},
+            {"name": "data",           "type": "bytes"},
+            {"name": "operation",      "type": "uint8"},
+            {"name": "safeTxGas",      "type": "uint256"},
+            {"name": "baseGas",        "type": "uint256"},
+            {"name": "gasPrice",       "type": "uint256"},
+            {"name": "gasToken",       "type": "address"},
+            {"name": "refundReceiver", "type": "address"},
+            {"name": "_nonce",         "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "bytes32"}],
+    },
+    {
+        "name": "nonce",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+    {
+        "name": "execTransaction",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "to",             "type": "address"},
+            {"name": "value",          "type": "uint256"},
+            {"name": "data",           "type": "bytes"},
+            {"name": "operation",      "type": "uint8"},
+            {"name": "safeTxGas",      "type": "uint256"},
+            {"name": "baseGas",        "type": "uint256"},
+            {"name": "gasPrice",       "type": "uint256"},
+            {"name": "gasToken",       "type": "address"},
+            {"name": "refundReceiver", "type": "address"},
+            {"name": "signatures",     "type": "bytes"},
+        ],
+        "outputs": [{"name": "success", "type": "bool"}],
+    },
+    {
+        "name": "getOwners",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "address[]"}],
+    },
+    {
+        "name": "getThreshold",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [],
         "outputs": [{"name": "", "type": "uint256"}],
     },
 ]
@@ -203,6 +296,9 @@ async def redeem_position(
 ) -> dict[str, Any]:
     """Call CTF.redeemPositions() on Polygon for one condition.
 
+    For sig_type==2 (Gnosis Safe), wraps the call in Safe.execTransaction()
+    so the Safe contract is msg.sender and its token balances are used.
+
     Parameters
     ----------
     condition_id_hex : str
@@ -210,10 +306,12 @@ async def redeem_position(
     Returns
     -------
     dict with keys:
-      ``success``   bool
-      ``tx_hash``   str | None
-      ``error``     str | None
-      ``gas_used``  int | None
+      ``success``               bool
+      ``tx_hash``               str | None
+      ``error``                 str | None
+      ``gas_used``              int | None
+      ``safe_exec``             bool  (True only when Safe path was taken)
+      ``verified_zero_balance`` bool  (True if post-tx balance confirmed zero)
     """
     return await asyncio.to_thread(
         _redeem_position_sync,
@@ -224,16 +322,24 @@ async def redeem_position(
 def _redeem_position_sync(
     condition_id_hex: str,
 ) -> dict[str, Any]:
-    """Synchronous inner implementation — runs in a thread pool."""
+    """Synchronous inner implementation — runs in a thread pool.
+
+    When cfg.POLYMARKET_SIGNATURE_TYPE == 2 the redemption is routed through
+    the Gnosis Safe (cfg.POLYMARKET_FUNDER_ADDRESS) via execTransaction so
+    that the Safe — the actual token holder — is msg.sender on the CTF
+    contract.  All other sig types keep the existing direct-EOA path.
+    """
     try:
         from web3 import Web3  # type: ignore
     except ImportError:
-        return {"success": False, "tx_hash": None, "error": "web3 not installed", "gas_used": None}
+        return {"success": False, "tx_hash": None, "error": "web3 not installed", "gas_used": None,
+                "safe_exec": False, "verified_zero_balance": False}
 
     try:
         w3 = _get_web3()
     except RuntimeError as exc:
-        return {"success": False, "tx_hash": None, "error": str(exc), "gas_used": None}
+        return {"success": False, "tx_hash": None, "error": str(exc), "gas_used": None,
+                "safe_exec": False, "verified_zero_balance": False}
 
     private_key = cfg.POLYMARKET_PRIVATE_KEY
     if not private_key:
@@ -242,12 +348,17 @@ def _redeem_position_sync(
             "tx_hash": None,
             "error": "POLYMARKET_PRIVATE_KEY not set",
             "gas_used": None,
+            "safe_exec": False,
+            "verified_zero_balance": False,
         }
+
+    sig_type = cfg.POLYMARKET_SIGNATURE_TYPE
 
     try:
         ctf = _get_ctf_contract(w3)
 
-        account = w3.eth.account.from_key(private_key).address
+        # EOA = the account derived from the private key
+        eoa_account = w3.eth.account.from_key(private_key).address
 
         collateral = Web3.to_checksum_address(USDC_E_ADDRESS)
 
@@ -262,6 +373,8 @@ def _redeem_position_sync(
                 "tx_hash": None,
                 "error": f"condition_id must be 32 bytes, got {len(cid_bytes)}",
                 "gas_used": None,
+                "safe_exec": False,
+                "verified_zero_balance": False,
             }
 
         # indexSets — pass [1, 2] to redeem all outcomes per Polymarket docs.
@@ -284,9 +397,39 @@ def _redeem_position_sync(
                 "tx_hash": None,
                 "error": "Market not yet resolved on-chain (payoutDenominator=0)",
                 "gas_used": None,
+                "safe_exec": False,
+                "verified_zero_balance": False,
             }
 
-        # --- Build transaction ---
+        # ---------------------------------------------------------------
+        # Build the redeemPositions() calldata (needed for both paths)
+        # ---------------------------------------------------------------
+        redeem_calldata = ctf.encode_abi(
+            "redeemPositions",
+            args=[collateral, parent_collection_id, cid_bytes, index_sets],
+        )
+
+        # ===================================================================
+        # PATH A — Gnosis Safe execTransaction (sig_type == 2)
+        # ===================================================================
+        if sig_type == 2:
+            return _redeem_via_safe(
+                w3=w3,
+                ctf=ctf,
+                eoa_account=eoa_account,
+                private_key=private_key,
+                redeem_calldata=redeem_calldata,
+                collateral=collateral,
+                parent_collection_id=parent_collection_id,
+                cid_bytes=cid_bytes,
+                index_sets=index_sets,
+                condition_id_hex=condition_id_hex,
+            )
+
+        # ===================================================================
+        # PATH B — Direct EOA call (sig_type != 2) — original behaviour
+        # ===================================================================
+        account = eoa_account
         nonce = w3.eth.get_transaction_count(account)
         gas_price = w3.eth.gas_price
 
@@ -316,37 +459,53 @@ def _redeem_position_sync(
             "chainId":  137,  # Polygon mainnet
         })
 
-        # --- Sign with private key ---
+        # Sign with private key
         signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
 
-        # --- Broadcast ---
+        # Broadcast
         tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
         tx_hash_hex = tx_hash.hex()
         log.info("Redemption tx broadcast: %s (condition=%s)", tx_hash_hex, condition_id_hex)
 
-        # --- Wait for receipt (up to 120 seconds) ---
+        # Wait for receipt (up to 120 seconds)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
         gas_used = receipt.get("gasUsed")
 
-        if receipt["status"] == 1:
-            log.info(
-                "Redemption confirmed: tx=%s gas_used=%s condition=%s",
-                tx_hash_hex, gas_used, condition_id_hex,
-            )
-            return {
-                "success": True,
-                "tx_hash": tx_hash_hex,
-                "error": None,
-                "gas_used": gas_used,
-            }
-        else:
+        if receipt["status"] != 1:
             log.error("Redemption tx REVERTED: tx=%s condition=%s", tx_hash_hex, condition_id_hex)
             return {
                 "success": False,
                 "tx_hash": tx_hash_hex,
                 "error": "Transaction reverted",
                 "gas_used": gas_used,
+                "safe_exec": False,
+                "verified_zero_balance": False,
             }
+
+        log.info(
+            "Redemption confirmed: tx=%s gas_used=%s condition=%s",
+            tx_hash_hex, gas_used, condition_id_hex,
+        )
+
+        # --- Phase 2: Post-tx balance verification (EOA path) ---
+        verified_zero = _verify_zero_balance(
+            ctf=ctf,
+            token_holder=account,
+            collateral=collateral,
+            parent_collection_id=parent_collection_id,
+            cid_bytes=cid_bytes,
+            index_sets=index_sets,
+            condition_id_hex=condition_id_hex,
+        )
+
+        return {
+            "success": True,
+            "tx_hash": tx_hash_hex,
+            "error": None,
+            "gas_used": gas_used,
+            "safe_exec": False,
+            "verified_zero_balance": verified_zero,
+        }
 
     except Exception as exc:
         tb_str = traceback.format_exc()
@@ -357,7 +516,217 @@ def _redeem_position_sync(
             "error": f"{type(exc).__name__}: {exc}",
             "error_detail": tb_str,
             "gas_used": None,
+            "safe_exec": False,
+            "verified_zero_balance": False,
         }
+
+
+def _redeem_via_safe(
+    w3,
+    ctf,
+    eoa_account: str,
+    private_key: str,
+    redeem_calldata: bytes,
+    collateral: str,
+    parent_collection_id: bytes,
+    cid_bytes: bytes,
+    index_sets: list,
+    condition_id_hex: str,
+) -> dict[str, Any]:
+    """Execute redeemPositions() through the Gnosis Safe via execTransaction.
+
+    The Safe (cfg.POLYMARKET_FUNDER_ADDRESS) is the token holder and will be
+    msg.sender on the CTF contract.  The EOA (derived from POLYMARKET_PRIVATE_KEY)
+    signs the Safe transaction hash and pays gas for the outer execTransaction call.
+    """
+    from web3 import Web3  # type: ignore
+
+    safe_address = Web3.to_checksum_address(cfg.POLYMARKET_FUNDER_ADDRESS)
+    ctf_address  = Web3.to_checksum_address(CTF_ADDRESS)
+    zero_address = "0x0000000000000000000000000000000000000000"
+
+    safe = w3.eth.contract(address=safe_address, abi=_SAFE_ABI)
+
+    # Safe execTransaction parameters
+    to             = ctf_address
+    value          = 0
+    data           = redeem_calldata
+    operation      = 0          # CALL
+    safe_tx_gas    = 0
+    base_gas       = 0
+    gas_price_safe = 0
+    gas_token      = zero_address
+    refund_receiver = zero_address
+    safe_nonce     = safe.functions.nonce().call()
+
+    log.info(
+        "Safe execTransaction: safe=%s ctf=%s nonce=%d condition=%s",
+        safe_address, ctf_address, safe_nonce, condition_id_hex,
+    )
+
+    # --- Get the Safe transaction hash from the contract (correct and canonical) ---
+    safe_tx_hash = safe.functions.getTransactionHash(
+        to,
+        value,
+        data,
+        operation,
+        safe_tx_gas,
+        base_gas,
+        gas_price_safe,
+        gas_token,
+        refund_receiver,
+        safe_nonce,
+    ).call()
+
+    # --- Sign the Safe tx hash with the EOA private key ---
+    # signHash returns a SignedMessage with v, r, s
+    signed = w3.eth.account.signHash(safe_tx_hash, private_key=private_key)
+    v = signed.v
+    r = signed.r
+    s = signed.s
+    # Pack as 65 bytes: r (32) + s (32) + v (1), big-endian
+    signatures = r.to_bytes(32, "big") + s.to_bytes(32, "big") + v.to_bytes(1, "big")
+
+    # --- Build the execTransaction call ---
+    nonce_eoa  = w3.eth.get_transaction_count(eoa_account)
+    gas_price  = w3.eth.gas_price
+
+    # Estimate gas for the outer execTransaction
+    try:
+        exec_tx_for_estimate = safe.functions.execTransaction(
+            to,
+            value,
+            data,
+            operation,
+            safe_tx_gas,
+            base_gas,
+            gas_price_safe,
+            gas_token,
+            refund_receiver,
+            signatures,
+        )
+        estimated_gas = exec_tx_for_estimate.estimate_gas({"from": eoa_account})
+        gas_limit = int(estimated_gas * 1.2)  # 20% buffer
+    except Exception:
+        log.warning("Safe execTransaction gas estimation failed — using fallback 300_000")
+        gas_limit = 300_000
+
+    tx = safe.functions.execTransaction(
+        to,
+        value,
+        data,
+        operation,
+        safe_tx_gas,
+        base_gas,
+        gas_price_safe,
+        gas_token,
+        refund_receiver,
+        signatures,
+    ).build_transaction({
+        "from":     eoa_account,
+        "nonce":    nonce_eoa,
+        "gas":      gas_limit,
+        "gasPrice": gas_price,
+        "chainId":  137,  # Polygon mainnet
+    })
+
+    # --- Sign and broadcast ---
+    signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
+    tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+    tx_hash_hex = tx_hash.hex()
+    log.info(
+        "Safe execTransaction broadcast: %s (condition=%s)",
+        tx_hash_hex, condition_id_hex,
+    )
+
+    # --- Wait for receipt ---
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    gas_used = receipt.get("gasUsed")
+
+    if receipt["status"] != 1:
+        log.error(
+            "Safe execTransaction REVERTED: tx=%s condition=%s",
+            tx_hash_hex, condition_id_hex,
+        )
+        return {
+            "success": False,
+            "tx_hash": tx_hash_hex,
+            "error": "Safe execTransaction reverted",
+            "gas_used": gas_used,
+            "safe_exec": True,
+            "verified_zero_balance": False,
+        }
+
+    log.info(
+        "Safe execTransaction confirmed: tx=%s gas_used=%s condition=%s",
+        tx_hash_hex, gas_used, condition_id_hex,
+    )
+
+    # --- Phase 2: Post-tx balance verification (Safe as token holder) ---
+    verified_zero = _verify_zero_balance(
+        ctf=ctf,
+        token_holder=safe_address,
+        collateral=collateral,
+        parent_collection_id=parent_collection_id,
+        cid_bytes=cid_bytes,
+        index_sets=index_sets,
+        condition_id_hex=condition_id_hex,
+    )
+
+    return {
+        "success": True,
+        "tx_hash": tx_hash_hex,
+        "error": None,
+        "gas_used": gas_used,
+        "safe_exec": True,
+        "verified_zero_balance": verified_zero,
+    }
+
+
+def _verify_zero_balance(
+    ctf,
+    token_holder: str,
+    collateral: str,
+    parent_collection_id: bytes,
+    cid_bytes: bytes,
+    index_sets: list,
+    condition_id_hex: str,
+) -> bool:
+    """Phase 2: Check that all position balances are zero after redemption.
+
+    Returns True if all relevant position balances are confirmed zero.
+    Returns False if any balance > 0 remains (partial/failed redemption) or
+    if the check itself fails (logs a warning and returns False).
+    """
+    try:
+        all_zero = True
+        for index_set in index_sets:
+            collection_id = ctf.functions.getCollectionId(
+                parent_collection_id, cid_bytes, index_set
+            ).call()
+            position_id = ctf.functions.getPositionId(collateral, collection_id).call()
+            balance = ctf.functions.balanceOf(token_holder, position_id).call()
+            if balance > 0:
+                log.warning(
+                    "Post-redemption balance check: holder=%s position_id=%s balance=%d "
+                    "(condition=%s indexSet=%d) — tokens remain after redemption",
+                    token_holder, position_id, balance, condition_id_hex, index_set,
+                )
+                all_zero = False
+
+        if all_zero:
+            log.info(
+                "Post-redemption balance check: all positions zero for condition=%s holder=%s",
+                condition_id_hex, token_holder,
+            )
+        return all_zero
+
+    except Exception as exc:
+        log.warning(
+            "Post-redemption balance verification failed for condition=%s: %s — proceeding",
+            condition_id_hex, exc,
+        )
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -386,11 +755,13 @@ async def scan_and_redeem(
         "outcome_index": int,
         "size": float,
         "title": str,
-        "success": bool,        # always True in dry_run
-        "tx_hash": str | None,  # None in dry_run
+        "success": bool,                # always True in dry_run
+        "tx_hash": str | None,          # None in dry_run
         "error": str | None,
         "gas_used": int | None,
         "dry_run": bool,
+        "safe_exec": bool,
+        "verified_zero_balance": bool,
       }
     """
     positions = await fetch_positions(wallet_address)
@@ -415,6 +786,8 @@ async def scan_and_redeem(
                 "error": None,
                 "gas_used": None,
                 "dry_run": True,
+                "safe_exec": False,
+                "verified_zero_balance": False,
             })
             continue
 

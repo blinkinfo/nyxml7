@@ -12,7 +12,7 @@ from telegram.ext import Application
 import config as cfg
 from bot import handlers
 from core.scheduler import recover_unresolved, start_scheduler
-from db.models import init_db, migrate_db
+from db.models import init_db, migrate_db, cleanup_bad_redemptions
 from polymarket.client import PolymarketClient
 
 logging.basicConfig(
@@ -46,6 +46,83 @@ def _validate_config() -> bool:
     return ok
 
 
+async def _startup_safe_sanity_check() -> None:
+    """Validate Safe/EOA config on startup. Logs warnings, does not block startup."""
+    import config as cfg
+
+    sig_type = cfg.POLYMARKET_SIGNATURE_TYPE
+    private_key = cfg.POLYMARKET_PRIVATE_KEY
+    funder = cfg.POLYMARKET_FUNDER_ADDRESS
+    rpc_url = cfg.POLYGON_RPC_URL
+
+    log.info("=== Wallet Sanity Check ===")
+    log.info("Signature type: %s", sig_type)
+
+    if not private_key:
+        log.warning("POLYMARKET_PRIVATE_KEY not set — skipping sanity check")
+        return
+    if not funder:
+        log.warning("POLYMARKET_FUNDER_ADDRESS not set — skipping sanity check")
+        return
+
+    try:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(rpc_url)) if rpc_url else None
+
+        from eth_account import Account
+        eoa_address = Account.from_key(private_key).address
+        log.info("EOA (signer) address:  %s", eoa_address)
+        log.info("Safe/proxy address:    %s", funder)
+
+        if eoa_address.lower() == funder.lower():
+            if sig_type == 2:
+                log.error(
+                    "MISCONFIGURATION: EOA == FUNDER but SIGNATURE_TYPE=2. "
+                    "With sig type 2 the EOA and Safe must be different addresses. "
+                    "Redemptions will fail."
+                )
+            else:
+                log.info("EOA == FUNDER (sig type %s — direct EOA mode, OK)", sig_type)
+        else:
+            log.info("EOA != FUNDER (sig type %s)", sig_type)
+            if sig_type != 2:
+                log.warning(
+                    "EOA != FUNDER but SIGNATURE_TYPE=%s (not 2). "
+                    "This may be a misconfiguration.", sig_type
+                )
+
+        # On-chain ownership check (only if RPC available and sig_type==2)
+        if sig_type == 2 and w3 and w3.is_connected():
+            try:
+                from core.redeemer import _SAFE_ABI
+                safe = w3.eth.contract(
+                    address=Web3.to_checksum_address(funder),
+                    abi=_SAFE_ABI,
+                )
+                owners = safe.functions.getOwners().call()
+                threshold = safe.functions.getThreshold().call()
+                owners_lower = [o.lower() for o in owners]
+                log.info("Safe owners: %s", owners)
+                log.info("Safe threshold: %s/%s", threshold, len(owners))
+                if eoa_address.lower() in owners_lower:
+                    log.info("OK: EOA is a listed owner of the Safe")
+                else:
+                    log.error(
+                        "MISCONFIGURATION: EOA %s is NOT listed as an owner of Safe %s. "
+                        "Redemptions will fail (EOA cannot sign Safe transactions).",
+                        eoa_address, funder,
+                    )
+            except Exception as exc:
+                log.warning("Could not verify Safe ownership on-chain: %s", exc)
+        elif sig_type == 2 and (not w3 or not w3.is_connected()):
+            log.warning("POLYGON_RPC_URL not available — skipping on-chain Safe ownership check")
+
+    except Exception as exc:
+        log.warning("Startup sanity check failed (non-fatal): %s", exc)
+
+    log.info("=== End Wallet Sanity Check ===")
+
+
 def main() -> None:
     if not _validate_config():
         sys.exit(1)
@@ -76,6 +153,11 @@ def main() -> None:
              recovery job is silently dropped (the `if SCHEDULER is not None`
              guard in recover_unresolved fires False for every signal).
         """
+        await migrate_db()
+        cleaned = await cleanup_bad_redemptions()
+        if cleaned:
+            log.info("Startup: cleaned %d incorrectly recorded redemption row(s)", cleaned)
+        await _startup_safe_sanity_check()
         start_scheduler(application, poly_client)
         await recover_unresolved()
 
