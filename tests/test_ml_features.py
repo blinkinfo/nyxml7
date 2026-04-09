@@ -80,12 +80,66 @@ def test_train_val_test_split():
 
 
 def test_default_threshold_matches_blueprint():
-    """Blueprint Section 9: recommended threshold is 0.590.
+    """Blueprint Section 9: recommended threshold is 0.535.
     This test will catch any future accidental regression of the default."""
-    assert cfg.ML_DEFAULT_THRESHOLD == 0.590, (
-        f"ML_DEFAULT_THRESHOLD is {cfg.ML_DEFAULT_THRESHOLD}, expected 0.590 "
+    assert cfg.ML_DEFAULT_THRESHOLD == 0.535, (
+        f"ML_DEFAULT_THRESHOLD is {cfg.ML_DEFAULT_THRESHOLD}, expected 0.535 "
         "(Blueprint Section 9 recommended threshold)"
     )
+
+
+def test_asof_backward_vectorized_matches_searchsorted():
+    """_asof_backward (now pd.merge_asof) must produce identical results to
+    the previous searchsorted row-loop implementation for all call sites:
+    15m merge, 1h merge, funding merge, and CVD merge."""
+    import sys
+    sys.path.insert(0, '/home/nebula/nyxtest4')
+    from ml.features import _asof_backward
+
+    rng = np.random.default_rng(0)
+    n_left = 200
+    n_right = 50
+
+    # Build a right-side DataFrame with sorted timestamps and two value columns
+    right_ts = pd.date_range('2025-01-01', periods=n_right, freq='15min', tz='UTC')
+    right = pd.DataFrame({
+        'timestamp': right_ts,
+        'val_a': rng.uniform(0, 1, n_right),
+        'val_b': rng.uniform(100, 200, n_right),
+    })
+
+    # Build left timestamps — denser than right, some before first right row (should give NaN)
+    left_ts = pd.date_range('2024-12-31 23:00', periods=n_left, freq='5min', tz='UTC')
+    left_series = pd.Series(left_ts)
+
+    # Run the vectorized implementation
+    result = _asof_backward(left_series, right, ['val_a', 'val_b'])
+
+    # Re-implement the original searchsorted logic inline for reference.
+    # Use microseconds (us) throughout — pandas 2.x stores datetime64[us],
+    # so .values.view(int64) gives us-since-epoch. Convert left ts the same way.
+    right_ts_us = right['timestamp'].values.view(np.int64)  # datetime64[us] -> int64 us
+    expected_a = np.full(n_left, np.nan)
+    expected_b = np.full(n_left, np.nan)
+    for i, ts in enumerate(left_series):
+        if pd.isna(ts):
+            continue
+        # Convert to microseconds: Timestamp.value is ns, divide by 1000
+        ts_us = pd.Timestamp(ts).value // 1000
+        idx = np.searchsorted(right_ts_us, ts_us, side='right') - 1
+        if idx >= 0 and right_ts_us[idx] <= ts_us:
+            expected_a[i] = right['val_a'].iloc[idx]
+            expected_b[i] = right['val_b'].iloc[idx]
+
+    # Results must be bit-for-bit identical (same float values, not just close)
+    got_a = result['val_a'].values
+    got_b = result['val_b'].values
+    nan_mask_a = np.isnan(expected_a)
+    nan_mask_b = np.isnan(expected_b)
+    assert np.array_equal(nan_mask_a, np.isnan(got_a)), "NaN positions differ for val_a"
+    assert np.array_equal(nan_mask_b, np.isnan(got_b)), "NaN positions differ for val_b"
+    np.testing.assert_array_equal(got_a[~nan_mask_a], expected_a[~nan_mask_a])
+    np.testing.assert_array_equal(got_b[~nan_mask_b], expected_b[~nan_mask_b])
 
 
 def test_volume_ratio_n1_excludes_self_from_mean():

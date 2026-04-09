@@ -46,7 +46,7 @@ LGBM_PARAMS = {
     "reg_alpha": 0.1,
     "reg_lambda": 0.1,
     "verbose": -1,
-    "n_jobs": -1,
+    "n_jobs": 1,  # 1 avoids multiprocess overhead on single-vCPU Railway instances
 }
 
 NUM_BOOST_ROUND = 1000
