@@ -64,6 +64,25 @@ CREATE TABLE IF NOT EXISTS redemptions (
     verified INTEGER NOT NULL DEFAULT 0,
     verified_at TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS ml_config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS model_registry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    slot TEXT NOT NULL,
+    train_date TEXT,
+    wr REAL,
+    precision_score REAL,
+    trades_per_day REAL,
+    threshold REAL,
+    sample_count INTEGER,
+    path TEXT,
+    metadata TEXT
+);
 """
 
 DEFAULT_SETTINGS = {
@@ -157,6 +176,33 @@ async def migrate_db(db_path: str | None = None) -> None:
             await db.execute(
                 "ALTER TABLE redemptions ADD COLUMN verified_at TIMESTAMP"
             )
+
+        # Check and create ml_config table (ML threshold storage)
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS ml_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+
+        # Check and create model_registry table
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS model_registry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                slot TEXT NOT NULL,
+                train_date TEXT,
+                wr REAL,
+                precision_score REAL,
+                trades_per_day REAL,
+                threshold REAL,
+                sample_count INTEGER,
+                path TEXT,
+                metadata TEXT
+            )
+        """)
+
+        # Seed default ML threshold
+        await db.execute(
+            "INSERT OR IGNORE INTO ml_config (key, value) VALUES ('ml_threshold', '0.535')"
+        )
 
         # Seed any missing default settings (idempotent)
         for key, value in DEFAULT_SETTINGS.items():

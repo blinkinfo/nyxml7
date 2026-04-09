@@ -605,3 +605,77 @@ def format_pattern_stats(rows: list[dict[str, Any]]) -> str:
         ]
     lines.append(SEP)
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# ML model formatters
+# ---------------------------------------------------------------------------
+
+def format_model_status(slot: str, meta: dict, threshold: float) -> str:
+    """Show model status summary."""
+    lines = [
+        SEP,
+        f"<b>ML Model Status</b> [{slot.upper()}]",
+        SEP,
+        f"Trained     : {str(meta.get('train_date', 'N/A'))[:19]}",
+        f"Test WR     : {meta.get('test_wr', 0)*100:.2f}%",
+        f"Val WR      : {meta.get('val_wr', 0)*100:.2f}%",
+        f"Trades/day  : {meta.get('test_trades_per_day', 0):.1f}",
+        f"Threshold   : {threshold:.3f}",
+        f"Samples     : {meta.get('sample_count', 0):,}",
+        f"Best iter   : {meta.get('best_iteration', 0)}",
+        SEP,
+    ]
+    return "\n".join(lines)
+
+
+def format_model_compare(current_meta: dict, candidate_meta: dict) -> str:
+    """Side by side comparison of current vs candidate model."""
+    def _fmt(m: dict, label: str) -> list[str]:
+        return [
+            f"<b>{label}</b>",
+            f"  Trained  : {str(m.get('train_date', 'N/A'))[:19]}",
+            f"  Test WR  : {m.get('test_wr', 0)*100:.2f}%",
+            f"  Val WR   : {m.get('val_wr', 0)*100:.2f}%",
+            f"  Trd/day  : {m.get('test_trades_per_day', 0):.1f}",
+            f"  Thresh   : {m.get('threshold', 0):.3f}",
+            f"  Samples  : {m.get('sample_count', 0):,}",
+        ]
+
+    lines = [SEP, "<b>Model Comparison</b>", SEP]
+    lines.extend(_fmt(current_meta, "CURRENT"))
+    lines.append("")
+    lines.extend(_fmt(candidate_meta, "CANDIDATE"))
+    lines.append(SEP)
+    lines.append("Use /promote_model to deploy candidate as current.")
+    return "\n".join(lines)
+
+
+def format_retrain_started() -> str:
+    """Notification that background retraining has started."""
+    return (
+        f"{SEP}\n"
+        "<b>Retraining started...</b>\n"
+        "Fetching 5 months of MEXC data and training LightGBM.\n"
+        "This takes ~5-10 minutes. You will receive a report when done.\n"
+        f"{SEP}"
+    )
+
+
+def format_retrain_complete(meta: dict, threshold: float) -> str:
+    """Show retrain results for candidate model."""
+    lines = [
+        SEP,
+        "<b>Retrain Complete (candidate saved)</b>",
+        SEP,
+        f"Trained     : {str(meta.get('train_date', 'N/A'))[:19]}",
+        f"Val WR      : {meta.get('val_wr', 0)*100:.2f}%",
+        f"Test WR     : {meta.get('test_wr', 0)*100:.2f}%",
+        f"Trades/day  : {meta.get('test_trades_per_day', 0):.1f}",
+        f"Threshold   : {threshold:.3f}",
+        f"Samples     : {meta.get('sample_count', 0):,}",
+        SEP,
+        "Use /model_compare to compare with current.",
+        "Use /promote_model to deploy.",
+    ]
+    return "\n".join(lines)

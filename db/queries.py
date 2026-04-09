@@ -866,3 +866,84 @@ async def get_pattern_stats() -> list[dict[str, Any]]:
 async def get_pattern_stats_for_export() -> list[dict[str, Any]]:
     """Same as get_pattern_stats() but returns all fields needed for XLS export."""
     return await get_pattern_stats()
+
+
+# ---------------------------------------------------------------------------
+# ML config helpers (ml_config table)
+# ---------------------------------------------------------------------------
+
+async def get_ml_config(key: str) -> str | None:
+    """Read a value from ml_config table."""
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT value FROM ml_config WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        return row["value"] if row else None
+
+
+async def set_ml_config(key: str, value: str) -> None:
+    """Upsert a value in ml_config table."""
+    async with aiosqlite.connect(_db()) as db:
+        await db.execute(
+            "INSERT INTO ml_config (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        await db.commit()
+
+
+async def get_ml_threshold() -> float:
+    """Get current ML inference threshold from DB."""
+    val = await get_ml_config("ml_threshold")
+    if val is not None:
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            pass
+    return cfg.ML_DEFAULT_THRESHOLD
+
+
+async def set_ml_threshold(threshold: float) -> None:
+    """Persist ML inference threshold to DB."""
+    await set_ml_config("ml_threshold", str(threshold))
+
+
+# ---------------------------------------------------------------------------
+# Model registry helpers
+# ---------------------------------------------------------------------------
+
+async def insert_model_registry(
+    slot: str,
+    train_date: str,
+    wr: float,
+    precision_score: float,
+    trades_per_day: float,
+    threshold: float,
+    sample_count: int,
+    path: str,
+    metadata_json: str,
+) -> int:
+    """Insert a new model registry entry. Returns the new row id."""
+    async with aiosqlite.connect(_db()) as db:
+        cursor = await db.execute(
+            """INSERT INTO model_registry
+               (slot, train_date, wr, precision_score, trades_per_day, threshold,
+                sample_count, path, metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (slot, train_date, wr, precision_score, trades_per_day, threshold,
+             sample_count, path, metadata_json),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_model_registry(slot: str = "current") -> dict | None:
+    """Return the most recent model_registry row for the given slot."""
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM model_registry WHERE slot = ? ORDER BY id DESC LIMIT 1",
+            (slot,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None

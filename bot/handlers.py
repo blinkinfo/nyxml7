@@ -25,12 +25,16 @@ from bot.formatters import (
     format_demo_stats,
     format_error_alert,
     format_help,
+    format_model_compare,
+    format_model_status,
     format_pattern_stats,
     format_recent_signals,
     format_recent_trades,
     format_redeem_preview,
     format_redeem_results,
     format_redemption_history,
+    format_retrain_complete,
+    format_retrain_started,
     format_signal_stats,
     format_status,
     format_trade_stats,
@@ -775,7 +779,13 @@ def register(application) -> None:
     application.add_handler(CommandHandler("redeem",      cmd_redeem))
     application.add_handler(CommandHandler("redemptions", cmd_redemptions))
     application.add_handler(CommandHandler("demo",        cmd_demo))
-    application.add_handler(CommandHandler("patterns",   cmd_patterns))
+    application.add_handler(CommandHandler("patterns",      cmd_patterns))
+    # ML model management commands
+    application.add_handler(CommandHandler("set_threshold",  cmd_set_threshold))
+    application.add_handler(CommandHandler("model_status",   cmd_model_status))
+    application.add_handler(CommandHandler("model_compare",  cmd_model_compare))
+    application.add_handler(CommandHandler("promote_model",  cmd_promote_model))
+    application.add_handler(CommandHandler("retrain",        cmd_retrain))
     application.add_handler(CallbackQueryHandler(callback_router))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
@@ -795,3 +805,128 @@ def register(application) -> None:
             log.exception("Failed to send error notification to Telegram")
 
     application.add_error_handler(_error_handler)
+
+
+# ---------------------------------------------------------------------------
+# ML model management commands
+# ---------------------------------------------------------------------------
+
+@auth_check
+async def cmd_set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set ML inference threshold. Usage: /set_threshold 0.56"""
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /set_threshold &lt;value&gt;\nExample: /set_threshold 0.56\nValid range: 0.50 - 0.95",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        threshold = float(context.args[0])
+    except (ValueError, IndexError):
+        await update.message.reply_text("Invalid value. Example: /set_threshold 0.56", parse_mode="HTML")
+        return
+    if not (0.50 <= threshold <= 0.95):
+        await update.message.reply_text(
+            "Threshold must be between 0.50 and 0.95.", parse_mode="HTML"
+        )
+        return
+    await queries.set_ml_threshold(threshold)
+    await update.message.reply_text(
+        f"ML threshold set to <b>{threshold:.3f}</b>. Active on next signal check.",
+        parse_mode="HTML",
+    )
+
+
+@auth_check
+async def cmd_model_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current ML model status."""
+    from ml import model_store
+    meta = model_store.load_metadata("current")
+    if meta is None:
+        await update.message.reply_text(
+            "No model trained yet. Use /retrain to train one.", parse_mode="HTML"
+        )
+        return
+    threshold = await queries.get_ml_threshold()
+    text = format_model_status("current", meta, threshold)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=back_to_menu())
+
+
+@auth_check
+async def cmd_model_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Compare current vs candidate model."""
+    from ml import model_store
+    current_meta = model_store.load_metadata("current")
+    candidate_meta = model_store.load_metadata("candidate")
+    if current_meta is None:
+        await update.message.reply_text(
+            "No current model. Use /retrain to train one.", parse_mode="HTML"
+        )
+        return
+    if candidate_meta is None:
+        await update.message.reply_text(
+            "No candidate model. Use /retrain to generate a candidate.", parse_mode="HTML"
+        )
+        return
+    text = format_model_compare(current_meta, candidate_meta)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=back_to_menu())
+
+
+@auth_check
+async def cmd_promote_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Promote candidate model to current."""
+    from ml import model_store
+    from core.strategies.ml_strategy import request_model_reload
+    if not model_store.has_model("candidate"):
+        await update.message.reply_text(
+            "No candidate model to promote. Use /retrain first.", parse_mode="HTML"
+        )
+        return
+    model_store.promote_candidate()
+    request_model_reload()
+    meta = model_store.load_metadata("current")
+    threshold = await queries.get_ml_threshold()
+    text = format_model_status("current (promoted)", meta or {}, threshold)
+    await update.message.reply_text(
+        f"{text}\n\nCandidate promoted to current. Model will reload on next signal check.",
+        parse_mode="HTML",
+    )
+
+
+@auth_check
+async def cmd_retrain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Trigger async background retraining."""
+    await update.message.reply_text(format_retrain_started(), parse_mode="HTML")
+    asyncio.create_task(_retrain_background(update, context))
+
+
+async def _retrain_background(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Background retraining: fetch data, build features, train, report."""
+    import asyncio as _asyncio
+    from ml import data_fetcher, features as feat_eng, trainer, model_store
+    try:
+        loop = _asyncio.get_event_loop()
+        log.info("Retrain: fetching 5 months of MEXC data...")
+        data = await loop.run_in_executor(None, lambda: data_fetcher.fetch_all(months=5))
+        log.info("Retrain: building features...")
+        df_feat = await loop.run_in_executor(
+            None, lambda: feat_eng.build_features(
+                data["df5"], data["df15"], data["df1h"], data["funding"], data["cvd"]
+            )
+        )
+        log.info("Retrain: training LightGBM (candidate slot)...")
+        result = await loop.run_in_executor(
+            None, lambda: trainer.train(df_feat, slot="candidate")
+        )
+        meta = model_store.load_metadata("candidate") or {}
+        threshold = result.get("threshold", 0.535)
+        text = format_retrain_complete(meta, threshold)
+        await update.message.reply_text(text, parse_mode="HTML")
+        log.info("Retrain complete. val_wr=%.4f test_wr=%.4f", result.get("val_wr", 0), result["test_metrics"].get("wr", 0))
+    except Exception as exc:
+        log.exception("Retrain background task failed: %s", exc)
+        err_text = format_error_alert(f"Retrain failed: {exc}")
+        try:
+            await update.message.reply_text(err_text, parse_mode="HTML")
+        except Exception:
+            pass
