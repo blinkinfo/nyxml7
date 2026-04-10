@@ -834,7 +834,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         trade_mode = await queries.get_trade_mode()
         demo_trade = await queries.is_demo_trade_enabled()
         demo_bankroll = await queries.get_demo_bankroll()
-        kb = settings_keyboard(autotrade, trade_amount, auto_redeem, demo_trade, demo_bankroll, trade_mode, pct)
+        invert_trades = await queries.is_invert_trades_enabled()
+        kb = settings_keyboard(autotrade, trade_amount, auto_redeem, demo_trade, demo_bankroll, trade_mode, pct, invert_trades)
         await update.message.reply_text(
             f"\u2699\ufe0f <b>Settings</b>\nAutoTrade: {'ON' if autotrade else 'OFF'}  |  Mode: {'PCT' if trade_mode == 'pct' else 'FIXED'} {pct}%  |  Demo: {'ON' if demo_trade else 'OFF'}",
             reply_markup=kb,
@@ -868,7 +869,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         trade_pct = await queries.get_trade_pct()
         demo_trade = await queries.is_demo_trade_enabled()
         trade_amount = await queries.get_trade_amount()
-        kb = settings_keyboard(autotrade, trade_amount, auto_redeem, demo_trade, amount, trade_mode, trade_pct)
+        invert_trades = await queries.is_invert_trades_enabled()
+        kb = settings_keyboard(autotrade, trade_amount, auto_redeem, demo_trade, amount, trade_mode, trade_pct, invert_trades)
         mode_summary = f"{trade_pct:.1f}%" if trade_mode == "pct" else f"${trade_amount:.2f}"
         await update.message.reply_text(
             f"\u2699\ufe0f <b>Settings</b>\nAutoTrade: {'ON' if autotrade else 'OFF'}  |  Mode: {mode_summary}  |  Demo: {'ON' if demo_trade else 'OFF'}",
@@ -950,8 +952,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     trade_pct = await queries.get_trade_pct()
     demo_trade = await queries.is_demo_trade_enabled()
     demo_bankroll = await queries.get_demo_bankroll()
+    invert_trades = await queries.is_invert_trades_enabled()
     mode_summary = f"{trade_pct:.1f}%" if trade_mode == "pct" else f"${amount:.2f}"
-    kb = settings_keyboard(autotrade, amount, auto_redeem, demo_trade, demo_bankroll, trade_mode, trade_pct)
+    kb = settings_keyboard(autotrade, amount, auto_redeem, demo_trade, demo_bankroll, trade_mode, trade_pct, invert_trades)
     await update.message.reply_text(
         f"\u2699\ufe0f <b>Settings</b>\nAutoTrade: {'ON' if autotrade else 'OFF'}  |  Mode: {mode_summary}  |  Demo: {'ON' if demo_trade else 'OFF'}",
         reply_markup=kb,

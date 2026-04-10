@@ -100,6 +100,7 @@ DEFAULT_SETTINGS = {
     "auto_redeem_enabled": "false",
     "demo_trade_enabled": "false",
     "demo_bankroll_usdc": "1000.00",
+    "invert_trades_enabled": "false",
 }
 
 
