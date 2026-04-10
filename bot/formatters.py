@@ -516,7 +516,10 @@ def format_help() -> str:
         "<b>Config</b>\n"
         "/settings  &middot; /demo\n\n"
         "<b>Misc</b>\n"
-        "/help  &middot; /start\n"
+        "/help  &middot; /start\n\n"
+        "<b>ML Thresholds</b>\n"
+        "/set_threshold &lt;val&gt;  — manually override the UP (LONG) inference threshold\n"
+        "/set_down_threshold &lt;val&gt;  — manually override the DOWN (SHORT) inference threshold\n"
         + SEP + "\n"
         "<b>How it works:</b>\n"
         "Every 5 minutes the bot analyses the last six closed BTC-USD "
@@ -785,6 +788,15 @@ def format_retrain_complete(meta: dict, threshold: float) -> str:
         "Use /promote_model to deploy.",
     ]
     return "\n".join(lines)
+
+
+def format_set_threshold(threshold: float) -> str:
+    """Confirmation message after /set_threshold."""
+    return (
+        f"\u2705 <b>UP threshold set to {threshold:.3f}</b>.\n"
+        "Active on next signal check.\n\n"
+        f"Signals will only LONG when p_up \u2265 <b>{threshold:.3f}</b>."
+    )
 
 
 def format_set_down_threshold(threshold: float) -> str:

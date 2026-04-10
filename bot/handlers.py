@@ -38,6 +38,7 @@ from bot.formatters import (
     format_retrain_blocked,
     format_retrain_complete,
     format_retrain_started,
+    format_set_threshold,
     format_set_down_threshold,
     format_signal_stats,
     format_status,
@@ -948,7 +949,7 @@ async def cmd_set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     await queries.set_ml_threshold(threshold)
     await update.message.reply_text(
-        f"ML threshold set to <b>{threshold:.3f}</b>. Active on next signal check.",
+        format_set_threshold(threshold),
         parse_mode="HTML",
     )
 
