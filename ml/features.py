@@ -599,57 +599,66 @@ def _validate_live_inputs(
 def _build_live_funding_frame(
     df5_live: pd.DataFrame,
     funding_rate_float: float | None,
-    funding_buffer: deque,
+    funding_records: deque,
 ) -> pd.DataFrame:
-    """Materialize a funding history DataFrame compatible with build_features().
+    """Materialize a live funding frame using real settlement timestamps.
 
-    Live runtime only keeps a rolling buffer of funding values, not their exact
-    timestamps. For canonical parity we reconstruct an 8h-settlement-aligned
-    history that is long enough for build_features() to resolve at least one
-    backward asof funding lookup for the current live window.
-
-    This does not change training behaviour; it only hardens the live wrapper so
-    limited or stale runtime buffers do not cause the canonical pipeline to drop
-    every row.
+    Preferred input is a deque of dict records with explicit settlement
+    timestamps. For backward compatibility during the parity patch integration,
+    callers that still pass a bare float deque are also accepted and converted
+    into a minimally viable synthetic history anchored to the latest known
+    settlement boundary.
     """
-    rates = [float(x) for x in funding_buffer if pd.notna(x)]
+    timestamped_records: list[dict[str, object]] = []
+    bare_rates: list[float] = []
+
+    for item in funding_records:
+        if isinstance(item, dict) and "timestamp" in item and "funding_rate" in item:
+            ts = pd.to_datetime(item["timestamp"], utc=True)
+            rate = float(item["funding_rate"])
+            if pd.notna(ts) and pd.notna(rate):
+                timestamped_records.append({"timestamp": ts, "funding_rate": rate})
+        else:
+            try:
+                rate = float(item)
+            except (TypeError, ValueError):
+                continue
+            if pd.notna(rate):
+                bare_rates.append(rate)
+
+    if timestamped_records:
+        funding_df = pd.DataFrame(timestamped_records)
+        funding_df = funding_df.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
+        return funding_df
+
+    if bare_rates:
+        last_ts = pd.Timestamp(df5_live["timestamp"].iloc[-1])
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.tz_localize("UTC")
+        else:
+            last_ts = last_ts.tz_convert("UTC")
+        settlement_hour = (last_ts.hour // 8) * 8
+        last_settlement = last_ts.replace(hour=settlement_hour, minute=0, second=0, microsecond=0)
+        timestamps = pd.date_range(end=last_settlement, periods=len(bare_rates), freq="8h", tz="UTC")
+        return pd.DataFrame({
+            "timestamp": timestamps,
+            "funding_rate": bare_rates,
+        })
+
     if funding_rate_float is not None and pd.notna(funding_rate_float):
-        current = float(funding_rate_float)
-        if not rates or not np.isclose(rates[-1], current, equal_nan=False):
-            rates = [*rates, current]
-    if not rates:
-        rates = [0.0]
+        last_ts = pd.Timestamp(df5_live["timestamp"].iloc[-1])
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.tz_localize("UTC")
+        else:
+            last_ts = last_ts.tz_convert("UTC")
+        settlement_hour = (last_ts.hour // 8) * 8
+        last_settlement = last_ts.replace(hour=settlement_hour, minute=0, second=0, microsecond=0)
+        return pd.DataFrame({
+            "timestamp": [last_settlement],
+            "funding_rate": [float(funding_rate_float)],
+        })
 
-    last_ts = pd.Timestamp(df5_live["timestamp"].iloc[-1])
-    if last_ts.tzinfo is None:
-        last_ts = last_ts.tz_localize("UTC")
-    else:
-        last_ts = last_ts.tz_convert("UTC")
-
-    first_ts = pd.Timestamp(df5_live["timestamp"].iloc[0])
-    if first_ts.tzinfo is None:
-        first_ts = first_ts.tz_localize("UTC")
-    else:
-        first_ts = first_ts.tz_convert("UTC")
-
-    settlement_hour = (last_ts.hour // 8) * 8
-    last_settlement = last_ts.replace(hour=settlement_hour, minute=0, second=0, microsecond=0)
-
-    first_settlement_hour = (first_ts.hour // 8) * 8
-    first_settlement = first_ts.replace(hour=first_settlement_hour, minute=0, second=0, microsecond=0)
-    if first_settlement > first_ts:
-        first_settlement -= pd.Timedelta(hours=8)
-
-    min_periods = max(2, int(((last_settlement - first_settlement) / pd.Timedelta(hours=8))) + 2)
-    if len(rates) < min_periods:
-        pad_value = rates[0]
-        rates = [pad_value] * (min_periods - len(rates)) + rates
-
-    timestamps = pd.date_range(end=last_settlement, periods=len(rates), freq="8h", tz="UTC")
-    return pd.DataFrame({
-        "timestamp": timestamps,
-        "funding_rate": rates,
-    })
+    return pd.DataFrame(columns=["timestamp", "funding_rate"])
 
 
 def build_live_features(
@@ -657,7 +666,7 @@ def build_live_features(
     df15_live: pd.DataFrame,
     df1h_live: pd.DataFrame,
     funding_rate_float: float | None,
-    funding_buffer: deque,
+    funding_records: deque,
     cvd_live: pd.DataFrame | None = None,
 ) -> "tuple[np.ndarray, list[str]] | tuple[None, list[str]]":
     """Build the live feature row via the canonical historical feature pipeline.
@@ -698,7 +707,7 @@ def build_live_features(
                 frame.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
                 frame.reset_index(drop=True, inplace=True)
 
-        funding_df = _build_live_funding_frame(df5, funding_rate_float, funding_buffer)
+        funding_df = _build_live_funding_frame(df5, funding_rate_float, funding_records)
 
         cvd_df = None
         if cvd_live is not None and not cvd_live.empty:

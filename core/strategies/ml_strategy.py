@@ -12,6 +12,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
+import pandas as pd
 
 from core.strategies.base import BaseStrategy
 from ml import data_fetcher
@@ -56,6 +57,7 @@ class MLStrategy(BaseStrategy):
     def __init__(self):
         self._model = None
         self._funding_buffer: deque = deque(maxlen=24)
+        self._funding_records: deque = deque(maxlen=24)
         self._model_slot = "current"
         # Track the last funding settlement timestamp that was appended to the
         # buffer.  MEXC settles funding every 8h (00:00, 08:00, 16:00 UTC).
@@ -83,23 +85,35 @@ class MLStrategy(BaseStrategy):
             )
 
     def _seed_funding_buffer(self) -> None:
-        """Seed the funding buffer with historical data on startup.
+        """Seed funding runtime state with historical records on startup.
 
-        Without seeding, the buffer starts empty and zscore is undefined for the
-        first 8 days of operation (24 periods * 8h each). This pre-fills the buffer
-        from MEXC historical funding so zscore is valid from the very first inference.
+        The live feature path now prefers timestamped funding settlements for
+        parity with training, but we also keep the float-only buffer populated
+        because other callers and diagnostics still inspect it directly.
         """
         try:
             history = data_fetcher.fetch_live_funding_history(n_periods=24)
-            if history:
-                for rate in history:
-                    self._funding_buffer.append(rate)
-                log.info(
-                    "MLStrategy: seeded funding_buffer with %d historical records",
-                    len(self._funding_buffer),
-                )
+            if history is None or history.empty:
+                log.warning("MLStrategy: could not seed funding state — no historical data returned")
+                return
+
+            seeded = 0
+            for row in history.itertuples(index=False):
+                rate = float(row.funding_rate)
+                ts = pd.Timestamp(row.timestamp)
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                else:
+                    ts = ts.tz_convert("UTC")
+                self._funding_buffer.append(rate)
+                self._funding_records.append({"timestamp": ts, "funding_rate": rate})
+                seeded += 1
+
+            if seeded:
+                self._last_funding_settlement = pd.Timestamp(self._funding_records[-1]["timestamp"]).to_pydatetime()
+                log.info("MLStrategy: seeded funding state with %d historical records", seeded)
             else:
-                log.warning("MLStrategy: could not seed funding_buffer — no historical data returned")
+                log.warning("MLStrategy: funding history fetch returned no usable rows")
         except Exception as exc:
             log.warning("MLStrategy: funding_buffer seed failed: %s", exc)
 
@@ -295,6 +309,7 @@ class MLStrategy(BaseStrategy):
                 current_settlement = self._current_funding_settlement()
                 if self._last_funding_settlement != current_settlement:
                     self._funding_buffer.append(funding_rate)
+                    self._funding_records.append({"timestamp": pd.Timestamp(current_settlement), "funding_rate": float(funding_rate)})
                     self._last_funding_settlement = current_settlement
                     log.debug(
                         "MLStrategy: funding_buffer updated for settlement=%s rate=%.6f buffer_len=%d",
@@ -305,7 +320,7 @@ class MLStrategy(BaseStrategy):
 
             # Build feature row — returns (row, nan_features) 2-tuple
             feature_row, nan_features = feat_eng.build_live_features(
-                df5, df15, df1h, funding_rate, self._funding_buffer, cvd_live
+                df5, df15, df1h, funding_rate, self._funding_records, cvd_live
             )
             if feature_row is None:
                 log.warning("MLStrategy: insufficient data for features, skipping")

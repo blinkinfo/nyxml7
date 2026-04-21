@@ -638,65 +638,49 @@ def fetch_gate_cvd(start_ms: int, end_ms: int) -> pd.DataFrame:
     return df
 
 
-def fetch_live_gate_cvd(limit: int = 400) -> pd.DataFrame:
+def fetch_live_gate_cvd(
+    limit: int = 400,
+    *,
+    end_ms: int | None = None,
+    anchor_timestamps: pd.Series | pd.Index | list | None = None,
+) -> pd.DataFrame:
     """Fetch the most recent `limit` 5m Gate.io CVD candles for live inference.
 
-    Uses the `limit` parameter directly (no from/to pagination needed for
-    recent data). Gate returns results in ascending timestamp order.
-
-    Args:
-        limit: Number of 5m candles to fetch (default 400, max 2000).
-
-    Returns:
-        DataFrame with columns: timestamp, long_taker_size, short_taker_size, open_interest
-        Sorted ascending by timestamp. Returns empty DataFrame on failure.
+    This wrapper still delegates to the canonical historical Gate fetch path used
+    by training, but it can now anchor the requested window to the actual live 5m
+    frame being scored instead of only to wall-clock time.
     """
-    _EMPTY = pd.DataFrame(columns=["timestamp", "long_taker_size", "short_taker_size", "open_interest"])
+    effective_limit = max(1, min(int(limit), _GATE_MAX_LIMIT))
+    buffer_candles = min(max(50, effective_limit // 4), 200)
+    window_candles = effective_limit + buffer_candles
 
-    params = {
-        "contract": _GATE_CONTRACT,
-        "interval": "5m",
-        "limit": min(limit, _GATE_MAX_LIMIT),
-    }
-    log.info("fetch_live_gate_cvd: fetching last %d 5m candles from Gate.io", limit)
+    anchor_end_ms = None
+    if anchor_timestamps is not None:
+        anchor_index = pd.to_datetime(pd.Index(anchor_timestamps), utc=True)
+        anchor_index = anchor_index[anchor_index.notna()]
+        if len(anchor_index) > 0:
+            anchor_end_ms = int(anchor_index.max().timestamp() * 1000) + (5 * 60 * 1000)
 
-    try:
-        with httpx.Client(timeout=15) as client:
-            resp = client.get(GATE_CONTRACT_STATS_URL, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as exc:
-        log.warning("fetch_live_gate_cvd: request error: %s", exc)
-        return _EMPTY
+    resolved_end_ms = int(end_ms) if end_ms is not None else anchor_end_ms
+    if resolved_end_ms is None:
+        resolved_end_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+    start_ms = resolved_end_ms - (window_candles * 5 * 60 * 1000)
 
-    if not isinstance(data, list) or not data:
-        log.warning("fetch_live_gate_cvd: empty response from Gate.io")
-        return _EMPTY
+    log.info(
+        "fetch_live_gate_cvd: fetching last %d candles via canonical Gate window [%d, %d) anchor_mode=%s",
+        effective_limit,
+        start_ms,
+        resolved_end_ms,
+        "frame" if anchor_end_ms is not None else "clock",
+    )
 
-    records = []
-    for row in data:
-        try:
-            ts_sec = int(row["time"])
-            lts = float(row.get("long_taker_size", 0) or 0)
-            sts = float(row.get("short_taker_size", 0) or 0)
-            oi  = float(row.get("open_interest", 0) or 0)
-            records.append({
-                "timestamp": pd.Timestamp(ts_sec * 1000, unit="ms", tz="UTC"),
-                "long_taker_size": lts,
-                "short_taker_size": sts,
-                "open_interest": oi,
-            })
-        except (KeyError, TypeError, ValueError) as exc:
-            log.debug("fetch_live_gate_cvd: skipping malformed row: %s — %s", row, exc)
-            continue
+    df = fetch_gate_cvd(start_ms=start_ms, end_ms=resolved_end_ms)
+    if df.empty:
+        log.warning("fetch_live_gate_cvd: canonical fetch returned no data")
+        return df
 
-    if not records:
-        log.warning("fetch_live_gate_cvd: no valid records parsed from response")
-        return _EMPTY
-
-    df = pd.DataFrame(records)
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    log.info("fetch_live_gate_cvd: returning %d candles", len(df))
+    df = df.tail(effective_limit).reset_index(drop=True)
+    log.info("fetch_live_gate_cvd: returning %d candles from canonical path", len(df))
     return df
 
 
@@ -779,13 +763,13 @@ def fetch_live_funding() -> float | None:
         return None
 
 
-def fetch_live_funding_history(n_periods: int = 24) -> list[float]:
-    """Fetch the last `n_periods` historical funding rates for seeding the zscore buffer.
+def fetch_live_funding_history(n_periods: int = 24) -> pd.DataFrame:
+    """Fetch the last `n_periods` historical funding records for live parity.
 
-    MEXC funding is every 8 hours (3/day). 24 periods = 8 days of history.
-    Returns a list of floats sorted oldest-first, ready to populate a deque(maxlen=24).
+    MEXC funding settles every 8 hours. Returning timestamped records instead of
+    bare floats lets the live path reuse the same real funding timestamps used in
+    training, avoiding synthetic reconstruction in the feature wrapper.
     """
-    # 24 periods * 8h = 192h back; add margin to ensure we get enough records
     now = datetime.now(timezone.utc)
     start = now - timedelta(hours=(n_periods + 4) * 8)
     start_ms = int(start.timestamp() * 1000)
@@ -794,14 +778,13 @@ def fetch_live_funding_history(n_periods: int = 24) -> list[float]:
     try:
         df = fetch_funding(start_ms, end_ms)
         if df.empty:
-            return []
-        # Return the last n_periods values, oldest-first
-        rates = df["funding_rate"].tail(n_periods).tolist()
-        log.info("fetch_live_funding_history: fetched %d records for buffer seed", len(rates))
-        return rates
+            return pd.DataFrame(columns=["timestamp", "funding_rate"])
+        records = df[["timestamp", "funding_rate"]].tail(n_periods).reset_index(drop=True)
+        log.info("fetch_live_funding_history: fetched %d records for buffer seed", len(records))
+        return records
     except Exception as e:
         log.warning("fetch_live_funding_history error: %s", e)
-        return []
+        return pd.DataFrame(columns=["timestamp", "funding_rate"])
 
 
 def _fetch_live_cvd_from_deals(n_candles: int = 400) -> pd.DataFrame:
