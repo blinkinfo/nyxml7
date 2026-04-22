@@ -122,6 +122,12 @@ async def init_db(db_path: str | None = None) -> None:
         await db.execute(
             "INSERT OR IGNORE INTO ml_config (key, value) VALUES ('ml_down_threshold', '0.47')"
         )
+        await db.execute(
+            "INSERT OR IGNORE INTO ml_config (key, value) VALUES ('ml_threshold_whitelist_enabled', '0')"
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO ml_config (key, value) VALUES ('ml_threshold_whitelist_values', '')"
+        )
         await db.commit()
 
 
@@ -255,8 +261,16 @@ async def migrate_db(db_path: str | None = None) -> None:
             await db.execute(
                 "INSERT OR IGNORE INTO ml_config (key, value) VALUES ('ml_threshold', '0.56')"
             )
+            await db.execute(
+                "INSERT OR IGNORE INTO ml_config (key, value) VALUES ('ml_threshold_whitelist_enabled', '0')"
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO ml_config (key, value) VALUES ('ml_threshold_whitelist_values', '')"
+            )
         except Exception as e:
             log.warning("migrate_db: ml_threshold seed failed: %s", e)
+
+        await db.commit()
 
         # --- seed default ML DOWN threshold (1 - up_threshold = 1 - 0.56 = 0.44) ---
         try:

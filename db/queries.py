@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+import math
 from datetime import datetime, timezone
 from typing import Any
 
 import aiosqlite
 import config as cfg
+
+MAX_ML_THRESHOLD = 0.95
+_log = logging.getLogger(__name__)
 
 
 def _db() -> str:
@@ -956,6 +961,85 @@ async def get_ml_down_threshold() -> float | None:
 async def set_ml_down_threshold(threshold: float) -> None:
     """Persist ML DOWN inference threshold to DB."""
     await set_ml_config("ml_down_threshold", str(threshold))
+
+
+def _parse_ml_threshold_whitelist_values(raw: str | None) -> list[float]:
+    """Parse and validate serialized threshold whitelist values from DB."""
+    if raw is None:
+        return []
+    stripped = raw.strip()
+    if not stripped:
+        return []
+
+    parts = [p.strip() for p in stripped.split(",")]
+    if any(not p for p in parts):
+        raise ValueError("empty whitelist value token")
+
+    values: set[float] = set()
+    for part in parts:
+        value = float(part)
+        if not math.isfinite(value):
+            raise ValueError("non-finite whitelist value")
+        if value > MAX_ML_THRESHOLD:
+            raise ValueError(f"value {value} exceeds max threshold {MAX_ML_THRESHOLD}")
+        values.add(round(value, 3))
+
+    return sorted(values)
+
+
+def _serialize_ml_threshold_whitelist_values(values: list[float]) -> str:
+    """Serialize threshold whitelist values as canonical comma-separated fixed-3 floats."""
+    canonical_values: set[float] = set()
+    for value in values:
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError("non-finite whitelist value")
+        if numeric > MAX_ML_THRESHOLD:
+            raise ValueError(f"value {numeric} exceeds max threshold {MAX_ML_THRESHOLD}")
+        canonical_values.add(round(numeric, 3))
+    return ",".join(f"{value:.3f}" for value in sorted(canonical_values))
+
+
+async def get_ml_threshold_whitelist_enabled() -> bool:
+    """Return whether ML threshold whitelist mode is enabled."""
+    raw = await get_ml_config("ml_threshold_whitelist_enabled")
+    if raw is None:
+        return False
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    _log.warning(
+        "Invalid ml_threshold_whitelist_enabled value in db: %r; using safe fallback disabled",
+        raw,
+    )
+    return False
+
+
+async def set_ml_threshold_whitelist_enabled(enabled: bool) -> None:
+    """Persist the ML threshold whitelist enabled toggle."""
+    await set_ml_config("ml_threshold_whitelist_enabled", "1" if enabled else "0")
+
+
+async def get_ml_threshold_whitelist_values() -> list[float]:
+    """Return parsed ML threshold whitelist values; safe-fallback to [] on parse errors."""
+    raw = await get_ml_config("ml_threshold_whitelist_values")
+    try:
+        return _parse_ml_threshold_whitelist_values(raw)
+    except Exception as exc:
+        _log.warning(
+            "Failed parsing ml_threshold_whitelist_values=%r; using safe fallback []: %s",
+            raw,
+            exc,
+        )
+        return []
+
+
+async def set_ml_threshold_whitelist_values(values: list[float]) -> None:
+    """Persist canonicalized ML threshold whitelist values."""
+    serialized = _serialize_ml_threshold_whitelist_values(values)
+    await set_ml_config("ml_threshold_whitelist_values", serialized)
 
 
 # ---------------------------------------------------------------------------
