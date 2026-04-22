@@ -728,8 +728,33 @@ def fetch_all(months: int = 5) -> dict:
 # Live fetchers (for MLStrategy real-time inference)
 # ---------------------------------------------------------------------------
 
-def fetch_live_5m(limit: int = 400) -> pd.DataFrame:
-    """Fetch last `limit` 5m candles from MEXC spot."""
+def fetch_live_5m(
+    limit: int = 400,
+    *,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+) -> pd.DataFrame:
+    """Fetch `limit` 5m candles from MEXC spot.
+
+    When start_ms and end_ms are provided, delegates to the canonical
+    fetch_5m(start_ms, end_ms) pagination path — guaranteeing exact
+    time-range parity with the training data path.
+
+    When neither is provided (legacy call), falls back to ccxt's
+    "last N candles" wall-clock approach for backwards compatibility.
+    """
+    if start_ms is not None and end_ms is not None:
+        # Canonical time-range fetch — identical approach to training.
+        # Request a slightly wider window so the final filter in fetch_5m
+        # still yields >= limit candles after range truncation.
+        log.info(
+            "fetch_live_5m: canonical time-range fetch [%d, %d) limit=%d",
+            start_ms, end_ms, limit,
+        )
+        df = fetch_5m(start_ms, end_ms)
+        return df.tail(limit).sort_values("timestamp").reset_index(drop=True)
+
+    # Legacy path: ccxt wall-clock fetch (no time-range anchor)
     exchange = ccxt.mexc()
     ohlcv = exchange.fetch_ohlcv("BTC/USDT", timeframe="5m", limit=limit)
     df = _ohlcv_to_df(ohlcv)

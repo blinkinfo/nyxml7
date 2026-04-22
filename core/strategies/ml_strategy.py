@@ -244,18 +244,47 @@ class MLStrategy(BaseStrategy):
                 return {**base_fields, "reason": "No model loaded"}
 
         try:
-            # Fetch live data in parallel using executor (blocking ccxt calls)
+            # Compute the canonical slot-aligned data window for feature parity
+            # with the training path.  All fetchers use the same end_ms boundary
+            # so the 5m/15m/1h/CVD data is exactly what training would have seen.
+            slot_end_ms = int(slot_ts.timestamp() * 1000)  # exclusive boundary
+            # Look-back: enough for the model's full context (400 candles) plus
+            # the 1h warmup buffer.  450 * 5min = 37.5h, which safely covers
+            # the entire training lookback for any feature.
+            data_start_ms = slot_end_ms - (450 * 5 * 60 * 1000)
+
+            log.info(
+                "MLStrategy: canonical data window [%d, %d) for slot %s",
+                data_start_ms, slot_end_ms, slug,
+            )
+
+            # Fetch live data with time-range anchored fetchers.
+            # fetch_live_5m  → canonical pagination path (start_ms, end_ms)
+            # fetch_live_15m → anchored to the same slot_end_ms
+            # fetch_live_1h  → anchored to the same slot_end_ms
+            # fetch_live_gate_cvd → anchored to the same slot_end_ms
             loop = asyncio.get_running_loop()
-            df5 = await loop.run_in_executor(None, lambda: data_fetcher.fetch_live_5m(400))
-            df5_anchor_ts = None
-            if df5 is not None and not df5.empty and "timestamp" in df5.columns:
-                df5_anchor_ts = pd.to_datetime(df5["timestamp"], utc=True)
+            df5 = await loop.run_in_executor(
+                None,
+                lambda: data_fetcher.fetch_live_5m(
+                    400, start_ms=data_start_ms, end_ms=slot_end_ms,
+                ),
+            )
 
             df15, df1h, funding_rate, cvd_live = await asyncio.gather(
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_15m(100, anchor_timestamps=df5_anchor_ts)),
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_1h(60, anchor_timestamps=df5_anchor_ts)),
+                loop.run_in_executor(
+                    None,
+                    lambda: data_fetcher.fetch_live_15m(100, end_ms=slot_end_ms),
+                ),
+                loop.run_in_executor(
+                    None,
+                    lambda: data_fetcher.fetch_live_1h(60, end_ms=slot_end_ms),
+                ),
                 loop.run_in_executor(None, data_fetcher.fetch_live_funding),
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_gate_cvd(400, anchor_timestamps=df5_anchor_ts)),
+                loop.run_in_executor(
+                    None,
+                    lambda: data_fetcher.fetch_live_gate_cvd(400, end_ms=slot_end_ms),
+                ),
             )
 
             # --- Data quality snapshot (before dropping the forming candle) ---
