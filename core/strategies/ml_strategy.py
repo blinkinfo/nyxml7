@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone
 from typing import Any
 
@@ -193,6 +194,11 @@ class MLStrategy(BaseStrategy):
         except Exception:
             pass
         return False
+
+    @staticmethod
+    def _normalize_threshold_value(value: float) -> Decimal:
+        """Normalize threshold values to 3 decimals for whitelist checks."""
+        return Decimal(str(float(value))).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
 
     async def check_signal(self) -> dict[str, Any] | None:
         """Generate an ML-based signal for slot N+1.
@@ -427,6 +433,8 @@ class MLStrategy(BaseStrategy):
             prob = float(self._model.predict(feature_row)[0])
             up_threshold   = await self._get_threshold()
             down_threshold = await self._get_down_threshold(up_threshold)
+            whitelist_enabled = await queries.get_ml_threshold_whitelist_enabled()
+            whitelist_values = await queries.get_ml_threshold_whitelist_values()
 
             # P(DOWN) = 1 - P(UP)
             prob_down = round(1.0 - prob, 6)
@@ -597,6 +605,58 @@ class MLStrategy(BaseStrategy):
                     "ml_down_threshold": down_threshold,
                     "ml_down_enabled": down_enabled,
                 }
+
+            if whitelist_enabled:
+                selected_threshold = up_threshold if side == "Up" else down_threshold
+                selected_norm = self._normalize_threshold_value(selected_threshold)
+                whitelist_norm = {
+                    self._normalize_threshold_value(value)
+                    for value in whitelist_values
+                }
+                if selected_norm not in whitelist_norm:
+                    whitelist_display = [f"{float(v):.3f}" for v in sorted(whitelist_norm)]
+                    skip_reason = (
+                        f"Threshold {float(selected_norm):.3f} not in whitelist {whitelist_display}"
+                    )
+                    log.info(
+                        "MLStrategy: whitelist block side=%s threshold=%.3f allowed=%s slot=%s",
+                        side, float(selected_norm), whitelist_display, slug,
+                    )
+                    inference_logger.log_inference(
+                        slot_slug=slug,
+                        slot_ts=slot_ts,
+                        slot_start_str=slot_start_str,
+                        slot_end_str=slot_end_str,
+                        df5_rows=df5_rows,
+                        df15_rows=df15_rows,
+                        df1h_rows=df1h_rows,
+                        cvd_rows=cvd_rows,
+                        funding_buf_len=funding_buf_len,
+                        candle_n1_ts=candle_n1_ts,
+                        candle_n1_close=candle_n1_close,
+                        candle_n1_vol=candle_n1_vol,
+                        feature_names=FEATURE_COLS,
+                        feature_row=feature_row,
+                        nan_features=[],
+                        p_up=prob,
+                        p_down=prob_down,
+                        up_threshold=up_threshold,
+                        down_threshold=down_threshold,
+                        down_enabled=down_enabled,
+                        fired=False,
+                        side=side,
+                        skip_reason=skip_reason,
+                    )
+                    return {
+                        **base_fields,
+                        "pattern": f"p_up={prob:.4f},p_down={prob_down:.4f}",
+                        "reason": skip_reason,
+                        "ml_p_up": prob,
+                        "ml_p_down": prob_down,
+                        "ml_up_threshold": up_threshold,
+                        "ml_down_threshold": down_threshold,
+                        "ml_down_enabled": down_enabled,
+                    }
 
             log.info(
                 "MLStrategy: side=%s p_up=%.4f p_down=%.4f up_thr=%.3f down_thr=%.3f "

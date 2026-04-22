@@ -958,6 +958,38 @@ async def set_ml_down_threshold(threshold: float) -> None:
     await set_ml_config("ml_down_threshold", str(threshold))
 
 
+async def get_ml_threshold_whitelist_enabled() -> bool:
+    """Return True when ML threshold whitelist enforcement is enabled."""
+    val = await get_ml_config("ml_threshold_whitelist_enabled")
+    if val is None:
+        return False
+    normalized = str(val).strip().lower()
+    return normalized in {"1", "true", "yes", "on"}
+
+
+async def get_ml_threshold_whitelist_values() -> list[float]:
+    """Return normalized whitelist values from ml_config as floats.
+
+    Supports comma-separated, space-separated, or JSON-like values.
+    Invalid tokens are ignored.
+    """
+    val = await get_ml_config("ml_threshold_whitelist_values")
+    if not val:
+        return []
+
+    raw = str(val).strip()
+    # tolerate simple JSON-like payloads such as "[0.57, 0.63]"
+    raw = raw.replace("[", " ").replace("]", " ")
+    tokens = [tok.strip() for tok in raw.replace(",", " ").split() if tok.strip()]
+
+    values: list[float] = []
+    for tok in tokens:
+        try:
+            values.append(float(tok))
+        except (TypeError, ValueError):
+            continue
+    return values
+
 # ---------------------------------------------------------------------------
 # Model registry helpers
 # ---------------------------------------------------------------------------
